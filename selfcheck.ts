@@ -1,10 +1,15 @@
 // Self-check: run with `node selfcheck.ts` (node >= 23.6 strips types natively).
+// Reads the real model list; override the path via MODEL_ROTATION_FILE.
 import { readFile } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import { strict as assert } from "node:assert"
 import { parseModelList, loadPool, makePicker, type ModelRef } from "./index.ts"
 
+const LIST_FILE = process.env.MODEL_ROTATION_FILE ?? join(homedir(), "src", "opencode_free_models.md")
+
 // 1. Parser on the real list file.
-const md = await readFile("/home/orca/src/opencode_free_models.md", "utf8")
+const md = await readFile(LIST_FILE, "utf8")
 const parsed = parseModelList(md)
 assert.equal(parsed.length, 10, `expected 10 unique models, got ${parsed.length}`)
 assert.deepEqual(
@@ -24,8 +29,8 @@ assert.deepEqual(
 )
 
 // 2. Exclusion (nemotron-3.5-lightning-free must be out of the pool).
-const { pool, source } = await loadPool("/home/orca/src/opencode_free_models.md", new Set(["nemotron-3.5-lightning-free"]))
-assert.equal(source, "/home/orca/src/opencode_free_models.md")
+const { pool, source } = await loadPool(LIST_FILE, new Set(["nemotron-3.5-lightning-free"]))
+assert.equal(source, LIST_FILE)
 assert.equal(pool.length, 9, `expected 9 after exclusion, got ${pool.length}`)
 assert.ok(!pool.some((m) => m.id === "nemotron-3.5-lightning-free"))
 
@@ -71,7 +76,7 @@ assert.equal(classifyError(undefined), undefined)
 
 // 5. Order: models in the `last` set go to the end of the queue.
 const { pool: poolOrdered } = await loadPool(
-  "/home/orca/src/opencode_free_models.md",
+  LIST_FILE,
   new Set(["nemotron-3.5-lightning-free"]),
   new Set(["nemotron-3.5-super-vl-free"]),
 )
