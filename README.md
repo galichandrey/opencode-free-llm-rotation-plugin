@@ -4,8 +4,8 @@
 
 ## Как работает
 
-1. Пул моделей берётся из markdown-файла (по умолчанию `~/src/opencode_free_models.md`) — все модели вида `provider/model`, найденные в бэктиках. Файл недоступен → используется встроенный список-фолбэк.
-2. Исключение: `nemotron-3.5-lightning-free` (слабая) не попадает в пул никогда — задаётся в `options.exclude`, можно расширить.
+1. Пул моделей берётся из markdown-файла (по умолчанию `~/src/opencode_free_models.md`) — все модели вида `provider/model`, найденные в бэктиках, в порядке файла. Файл недоступен → используется встроенный список-фолбэк.
+2. Исключение: `nemotron-3.5-lightning-free` (слабая) не попадает в пул никогда — задаётся в `options.exclude`, можно расширить. Порядок очереди можно подправить опцией `last` — эти модели замыкают круг (по умолчанию `nemotron-3.5-super-vl-free`, ставится последней).
 3. Хук `session.hook("retry")`: если модель из пула падает — ошибки делятся на два ротируемых класса:
    - **rate** — 429 / «rate limit» / «quota» / «capacity»;
    - **unusable** — модель не обслуживаема прямо сейчас в обход лимита: `403` гео-блок («not available in your country»), таймауты, HTTP 5xx/unavailable.
@@ -23,12 +23,14 @@
 
 ```jsonc
 {
+  "$schema": "https://opencode.ai/config.json",
   "plugins": [
     {
       "package": "/abs/path/to/opencode-model-rotation",
       "options": {
         "file": "~/src/opencode_free_models.md",   // источник списка моделей
         "exclude": ["nemotron-3.5-lightning-free"], // добавить свои — это заменит дефолт
+        "last": ["nemotron-3.5-super-vl-free"],     // модели, замыкающие очередь (дефолт)
         "retryDelay": 300                          // мс перед повторной попыткой
       }
     }

@@ -69,4 +69,25 @@ assert.equal(classifyError({ status: 502, message: "Bad gateway" }), "unusable")
 assert.equal(classifyError({ message: "Prompt is too long: 210000 tokens > 200000 maximum" }), undefined)
 assert.equal(classifyError(undefined), undefined)
 
+// 5. Order: models in the `last` set go to the end of the queue.
+const { pool: poolOrdered } = await loadPool(
+  "/home/orca/src/opencode_free_models.md",
+  new Set(["nemotron-3.5-lightning-free"]),
+  new Set(["nemotron-3.5-super-vl-free"]),
+)
+assert.deepEqual(
+  poolOrdered.map((m) => m.id),
+  [
+    "beam-free",
+    "big-pickle",
+    "deepseek-v4.1-flash-free",
+    "glm-5.3-flash-free",
+    "longcat-2.5-preview-free",
+    "mimo-v2.6-flash-free",
+    "nemotron-3-ultra-free",
+    "space-bunny-free",
+    "nemotron-3.5-super-vl-free",
+  ],
+)
+
 console.log("selfcheck OK")

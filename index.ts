@@ -43,6 +43,7 @@ export function parseModelList(md: string): ModelRef[] {
 export async function loadPool(
   file: string,
   exclude: Set<string>,
+  last = new Set<string>(),
 ): Promise<{ pool: ModelRef[]; source: string }> {
   let md: string | undefined
   try {
@@ -54,9 +55,23 @@ export async function loadPool(
     list.filter((m) => !exclude.has(m.id) && !exclude.has(`${m.providerID}/${m.id}`))
   if (md) {
     const pool = filtered(parseModelList(md))
-    if (pool.length) return { pool, source: file }
+    if (pool.length) return { pool: reorderLast(pool, last), source: file }
   }
-  return { pool: filtered(FALLBACK_IDS.map((id) => ({ providerID: "opencode", id }))), source: "builtin-fallback" }
+  return {
+    pool: reorderLast(filtered(FALLBACK_IDS.map((id) => ({ providerID: "opencode", id }))), last),
+    source: "builtin-fallback",
+  }
+}
+
+/**
+ * Move models listed in `last` (by id or provider/id) to the end of the pool,
+ * preserving their relative order.
+ */
+export function reorderLast(pool: ModelRef[], last: Set<string>): ModelRef[] {
+  const head: ModelRef[] = []
+  const tail: ModelRef[] = []
+  for (const m of pool) (last.has(m.id) || last.has(`${m.providerID}/${m.id}`) ? tail : head).push(m)
+  return [...head, ...tail]
 }
 
 /**
@@ -117,8 +132,12 @@ export default {
     const exclude = new Set<string>(
       Array.isArray(opts.exclude) ? opts.exclude.map(String) : DEFAULT_EXCLUDE,
     )
+    // Models that should be tried last (стойкие до деградаций, слабые или медленные).
+    const last = new Set<string>(
+      Array.isArray(opts.last) ? opts.last.map(String) : ["nemotron-3.5-super-vl-free"],
+    )
 
-    let { pool, source } = await loadPool(file, exclude)
+    let { pool, source } = await loadPool(file, exclude, last)
     const pick = makePicker(() => pool)
     const dropped = new Map<string, number>()
     let enabled = (await ctx.storage.get("enabled")) !== false
@@ -251,7 +270,7 @@ export default {
           } else if (raw === "list") {
             reply = `pool (${pool.length}):\n` + pool.map((m) => `- opencode/${m.id}`).join("\n")
           } else if (raw === "refresh") {
-            const loaded = await loadPool(file, exclude)
+            const loaded = await loadPool(file, exclude, last)
             pool = loaded.pool
             source = loaded.source
             reply = statusText()
