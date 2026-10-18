@@ -102,6 +102,47 @@ export function makePicker(getPool: () => ModelRef[]) {
 
 const expandTilde = (p: string) => p.replace(/^~(?=\/|$)/, homedir())
 
+// Plugin stdout is swallowed by the server; keep a dedicated log file for
+// diagnosability: ~/.local/share/opencode/log/model-rotation.log
+function makeLogger() {
+  const logDir = join(homedir(), ".local/share/opencode/log")
+  try {
+    mkdirSync(logDir, { recursive: true })
+  } catch {
+    // log write failures are non-fatal
+  }
+  const logFile = join(logDir, "model-rotation.log")
+  return (...a: unknown[]) => {
+    try {
+      appendFileSync(logFile, `[${new Date().toISOString()}] ${a.map((x) => String(x)).join(" ")}\n`)
+    } catch {
+      // ignore
+    }
+  }
+}
+
+// Registry outputs vary across hosts/versions; accept array, .data or .models.
+function listOf(out: any): any[] {
+  if (Array.isArray(out)) return out
+  return Array.isArray(out?.data) ? out.data : Array.isArray(out?.models) ? out.models : []
+}
+
+/**
+ * Split a pool against a model registry: keep only models that actually exist.
+ * An empty registry (e.g. not yet materialized at plugin setup) means "skip".
+ */
+export function filterKnown(list: ModelRef[], known: Set<string>): { active: ModelRef[]; missing: string[] } {
+  if (known.size === 0) return { active: [...list], missing: [] }
+  const active: ModelRef[] = []
+  const missing: string[] = []
+  for (const m of list) {
+    const token = `${m.providerID}/${m.id}`
+    if (known.has(token)) active.push(m)
+    else missing.push(token)
+  }
+  return { active, missing }
+}
+
 const RATE_RE = /(^|\W)429(\W|$)|rate.?limit|quota|capacity/i
 // Upstream failures that make a pool model unservable right now even though it
 // is not rate-out: geo-blocks ("not available in your country"), timeouts,
@@ -123,8 +164,116 @@ export function classifyError(e: any): "rate" | "unusable" | undefined {
   return undefined
 }
 
+// ---------------------------------------------------------------------------
+// OpenCode 1.x (V1) support: same package, V1 plugin contract of hooks.
+// V1 reality check: no retry hook and no per-session model endpoint, so the
+// rotation is reactive — detect session.error, notify via TUI toast and try a
+// best-effort session.update with the next pool model.
+// ---------------------------------------------------------------------------
+export async function FreeLLMRotation(ctx1: any) {
+  const client = ctx1?.client
+  const log = makeLogger()
+  // V1 plugins receive no config options; the file path is overridable via env.
+  const file = expandTilde(process.env.MODEL_ROTATION_FILE ?? DEFAULT_FILE)
+  const last = new Set<string>(["nemotron-3.5-super-vl-free"])
+  let { pool } = await loadPool(file, new Set(DEFAULT_EXCLUDE), last)
+  const pick = makePicker(() => pool)
+  const dropped = new Map<string, number>()
+
+  // Best-effort registry validation; skip silently if the endpoint differs.
+  try {
+    const out = await client?.config?.providers?.()
+    const known = new Set<string>()
+    for (const p of listOf(out?.providers ?? out)) {
+      for (const m of listOf((p as any)?.models)) {
+        const prov = (p as any)?.id ?? (p as any)?.providerID
+        const id = (m as any)?.id ?? (m as any)?.modelID
+        if (prov && id) known.add(`${prov}/${id}`)
+      }
+    }
+    const filtered = filterKnown(pool, known)
+    if (filtered.missing.length) log(`[v1] not in registry (dropped): ${filtered.missing.join(", ")}`)
+    pool = filtered.active
+  } catch (e) {
+    log("[v1] registry validation skipped:", e)
+  }
+  log(`[v1] pool=${pool.length} models`)
+
+  const toast = (message: string, variant = "warning") => {
+    try {
+      void client?.tui
+        ?.showToast?.({ body: { message, variant } })
+        ?.catch?.((e: any) => log("[v1] toast failed:", e))
+    } catch (e) {
+      log("[v1] toast failed:", e)
+    }
+  }
+
+  return {
+    event: async ({ event }: any) => {
+      try {
+        if (event?.type !== "session.error") return
+        if (!pool.length) return
+        const props = event.properties ?? {}
+        const rawError =
+          props?.error && typeof props.error === "object" ? props.error : { message: JSON.stringify(props) }
+        const cls = classifyError(rawError)
+        if (!cls) {
+          log(`[v1] session error is not rotatable (${String(rawError.message).slice(0, 120)})`)
+          return
+        }
+        const sessionID = props?.sessionID
+        if (!sessionID) return
+
+        // The failed model: prefer the event payload, else the session record.
+        let failed = (props?.error?.model ?? props?.model) as any
+        if (!failed && client?.session?.get) {
+          try {
+            const s = await client.session.get({ path: { id: sessionID } })
+            failed = s?.data?.model ?? s?.model
+          } catch {
+            // session lookup is optional
+          }
+        }
+        const failedId = failed?.modelID ?? failed?.id
+        if (!failedId || !pool.some((p) => p.id === failedId)) {
+          log(`[v1] error on non-pool model ${failedId ?? "?"}, not rotating`)
+          return
+        }
+
+        dropped.set(failedId, Date.now())
+        const next = pick(failedId, dropped, COOLDOWN_MS)
+        let detail = `${cls === "rate" ? "лимит/квота" : "недоступна"}`
+        let switched = false
+        if (next) {
+          try {
+            await client.session.update?.({
+              path: { id: sessionID },
+              body: { model: { providerID: next.providerID, modelID: next.id, id: next.id } },
+            })
+            switched = true
+            log(`[v1] opencode/${failedId} -> opencode/${next.id} (${cls}, session ${sessionID})`)
+          } catch (e) {
+            log("[v1] session.update failed:", e)
+          }
+          if (switched) detail += `: switched to opencode/${next.id}`
+          else detail += `: переключите модель вручную (/models)`
+        } else {
+          detail += `: весь пул остывает, переключитесь вручную (/models)`
+        }
+        toast(`🔄 [model-rotation] opencode/${failedId} — ${detail}`)
+      } catch (e) {
+        log("[v1] event hook error:", e)
+      }
+    },
+  }
+}
+
 export default {
   id: "model-rotation",
+  // V1 loaders (>=1.18.29) read this; V2 ignores it. Named `FreeLLMRotation`
+  // export covers older V1 releases that expect plugin functions.
+  server: FreeLLMRotation,
   async setup(ctx: any) {
     const opts = ctx.options ?? {}
     const file = expandTilde(String(opts.file ?? DEFAULT_FILE))
@@ -138,27 +287,33 @@ export default {
     )
 
     let { pool, source } = await loadPool(file, exclude, last)
+
+    // Drop models that do not exist in OpenCode's model registry (refreshed
+    // also by /rotation refresh). An empty registry means "not ready" — skip.
+    let known = new Set<string>()
+    let offRegistry: string[] = []
+    const refreshKnown = async () => {
+      known = new Set()
+      try {
+        for (const m of listOf(await ctx.model.list())) {
+          const prov = (m as any).providerID
+          const id = (m as any).id ?? (m as any).modelID
+          if (prov && id) known.add(`${prov}/${id}`)
+        }
+      } catch (e) {
+        log("model registry read failed:", e)
+        known = new Set()
+      }
+    }
+    await refreshKnown()
+    ;({ active: pool, missing: offRegistry } = filterKnown(pool, known))
+    if (offRegistry.length) log(`not in registry (dropped from rotation): ${offRegistry.join(", ")}`)
     const pick = makePicker(() => pool)
     const dropped = new Map<string, number>()
     let enabled = (await ctx.storage.get("enabled")) !== false
     let lastPick: string | undefined
 
-    // Plugin stdout is swallowed by the server, so keep a dedicated log file
-    // for diagnosability: ~/.local/share/opencode/log/model-rotation.log
-    const logDir = join(homedir(), ".local/share/opencode/log")
-    try {
-      mkdirSync(logDir, { recursive: true })
-    } catch {
-      // log write failures are non-fatal
-    }
-    const logFile = join(logDir, "model-rotation.log")
-    const log = (...a: unknown[]) => {
-      try {
-        appendFileSync(logFile, `[${new Date().toISOString()}] ${a.map((x) => String(x)).join(" ")}\n`)
-      } catch {
-        // ignore
-      }
-    }
+    const log = makeLogger()
     log(`pool=${pool.length} models (source: ${source}); enabled=${enabled}`)
 
     const rotateFromTo = async (sessionID: string, from: string) => {
@@ -245,7 +400,7 @@ export default {
         .map(([id, at]) => `  - opencode/${id} (${((COOLDOWN_MS - (now - at)) / 60000).toFixed(1)}min)`)
       return (
         `Model rotation: ${enabled ? "ON" : "OFF"}\n` +
-        `pool: ${pool.length} models (source: ${source})\n` +
+        `pool: ${pool.length} models${offRegistry.length ? ` (+${offRegistry.length} not in registry)` : ""} (source: ${source})\n` +
         (lastPick ? `last switched to: opencode/${lastPick}\n` : "") +
         (cooling.length ? `cooling down:\n${cooling.join("\n")}` : "")
       )
@@ -270,10 +425,15 @@ export default {
           } else if (raw === "list") {
             reply = `pool (${pool.length}):\n` + pool.map((m) => `- opencode/${m.id}`).join("\n")
           } else if (raw === "refresh") {
+            await refreshKnown()
             const loaded = await loadPool(file, exclude, last)
             pool = loaded.pool
             source = loaded.source
-            reply = statusText()
+            ;({ active: pool, missing: offRegistry } = filterKnown(pool, known))
+            if (offRegistry.length) log(`not in registry (dropped from rotation): ${offRegistry.join(", ")}`)
+            reply =
+              statusText() +
+              (offRegistry.length ? `\nnot in registry (not rotating): ${offRegistry.join(", ")}` : "")
           } else if (raw === "" || raw === "status") {
             if (raw === "") {
               enabled = !enabled

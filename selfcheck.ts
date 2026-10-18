@@ -90,4 +90,22 @@ assert.deepEqual(
   ],
 )
 
+// 6. Registry validation: known set keeps existing models, drops the rest;
+//    an empty registry (not ready) skips filtering.
+import { filterKnown } from "./index.ts"
+const reg = new Set([
+  "opencode/a",
+  "opencode/c",
+  "opencode/d",
+])
+const fk = filterKnown(four, reg)
+assert.deepEqual(
+  fk.active.map((m) => m.id),
+  ["a", "c", "d"],
+)
+assert.deepEqual(fk.missing, ["opencode/b"])
+const skip = filterKnown(four, new Set())
+assert.equal(skip.active.length, 4)
+assert.equal(skip.missing.length, 0)
+
 console.log("selfcheck OK")
